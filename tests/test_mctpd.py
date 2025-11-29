@@ -1290,3 +1290,64 @@ async def test_get_message_types(dbus, mctpd):
     cmd = MCTPControlCommand(True, 0, 0x04, bytes([0x05]))
     rsp = await ep.send_control(mctpd.network.mctp_socket, cmd)
     assert rsp.hex(' ') == '00 04 00 01 f4 f3 f2 f1'
+
+""" Test RegisterVDMTypeSupport with PCIe and IANA VDMs """
+async def test_register_vdm_type_support(mctpd):
+    ep = mctpd.network.endpoints[0]
+    ep.eid = 12
+    iface = mctpd.system.interfaces[0]
+    await mctpd.system.add_route(mctpd.system.Route(ep.eid, 1, iface = iface))
+    await mctpd.system.add_neighbour(
+        mctpd.system.Neighbour(iface, ep.lladdr, ep.eid)
+    )
+
+    # Verify error response when no VDM is registered
+    cmd = MCTPControlCommand(True, 0, 0x06, bytes([0x00]))
+    rsp = await ep.send_control(mctpd.network.mctp_socket, cmd)
+    assert rsp.hex(' ') == '00 06 01'
+
+    async with asyncdbus.MessageBus().connect() as temp_bus:
+        mctp = await mctpd_mctp_base_iface_obj(temp_bus)
+
+        # Register PCIe VDM: format=0x00, VID=0xABCD, command_set=0x0001
+        await mctp.call_register_vdm_type_support(0x00,
+                            asyncdbus.Variant('q', 0xABCD), 0x0001)
+
+        # Register IANA VDM: format=0x01, VID=0x1234ABCD, command_set=0x5678
+        await mctp.call_register_vdm_type_support(0x01,
+                            asyncdbus.Variant('u', 0x1234ABCD), 0x5678)
+
+        # Verify DBus call fails with invalid format 0x02
+        with pytest.raises(asyncdbus.errors.DBusError) as ex:
+            await mctp.call_register_vdm_type_support(0x02,
+                                asyncdbus.Variant('q', 0xABCD), 0x0001)
+        assert "Unsupported VID format" in str(ex.value)
+
+        # Verify DBus call fails with duplicate PCIe VDM
+        with pytest.raises(asyncdbus.errors.DBusError) as ex:
+            await mctp.call_register_vdm_type_support(0x00,
+                            asyncdbus.Variant('q', 0xABCD), 0x0001)
+        assert str(ex.value) == "VDM type already registered"
+
+        # Verify PCIe VDM (selector 0)
+        cmd = MCTPControlCommand(True, 0, 0x06, bytes([0x00]))
+        rsp = await ep.send_control(mctpd.network.mctp_socket, cmd)
+        assert rsp.hex(' ') == '00 06 00 01 00 ab cd 00 01'
+
+        # Verify IANA VDM (selector 1)
+        cmd = MCTPControlCommand(True, 0, 0x06, bytes([0x01]))
+        rsp = await ep.send_control(mctpd.network.mctp_socket, cmd)
+        assert rsp.hex(' ') == '00 06 00 ff 01 12 34 ab cd 56 78'
+
+        # Verify error with incorrect selector
+        cmd = MCTPControlCommand(True, 0, 0x06, bytes([0x05]))
+        rsp = await ep.send_control(mctpd.network.mctp_socket, cmd)
+        assert rsp.hex(' ') == '00 06 02'
+
+    # Give mctpd a moment to process the disconnection
+    await trio.sleep(0.1)
+
+    # Verify VDM types are removed after disconnect
+    cmd = MCTPControlCommand(True, 0, 0x06, bytes([0x00]))
+    rsp = await ep.send_control(mctpd.network.mctp_socket, cmd)
+    assert rsp.hex(' ') == '00 06 01'  # Should be error again
