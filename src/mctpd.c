@@ -1039,6 +1039,7 @@ handle_control_get_vdm_type_support(struct ctx *ctx, int sd,
 	vdm_count = ctx->num_supported_vdm_types;
 	// Allocate space for 32 bit VID + 16 bit cmd set
 	max_rsp_len = sizeof(*resp) + sizeof(uint16_t);
+	resp_len = max_rsp_len;
 	resp_buf = malloc(max_rsp_len);
 	if (!resp_buf) {
 		warnx("Failed to allocate response buffer");
@@ -1067,6 +1068,7 @@ handle_control_get_vdm_type_support(struct ctx *ctx, int sd,
 		resp->vendor_id_format = cur_vdm->format;
 
 		if (cur_vdm->format == VID_FORMAT_PCIE) {
+			// 4 bytes was reserved for VID, but PCIe VID uses only 2 bytes.
 			cmd_type_ptr--;
 			resp_len = max_rsp_len - sizeof(uint16_t);
 			resp->vendor_id_data_pcie =
