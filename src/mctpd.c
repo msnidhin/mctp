@@ -208,8 +208,13 @@ struct msg_type_support {
 	sd_bus_track *source_peer;
 };
 
+enum vid_format {
+	VID_FORMAT_PCIE = MCTP_GET_VDM_SUPPORT_PCIE_FORMAT_ID,
+	VID_FORMAT_IANA = MCTP_GET_VDM_SUPPORT_IANA_FORMAT_ID,
+};
+
 struct vdm_type_support {
-	uint8_t vid_format;
+	enum vid_format format;
 	union {
 		uint16_t pcie;
 		uint32_t iana;
@@ -1017,10 +1022,11 @@ handle_control_get_vdm_type_support(struct ctx *ctx, int sd,
 				    const struct sockaddr_mctp_ext *addr,
 				    const uint8_t *buf, const size_t buf_size)
 {
-	size_t resp_len, max_rsp_len, vdm_count, vid_size_left;
 	struct mctp_ctrl_resp_get_vdm_support *resp = NULL;
 	struct mctp_ctrl_cmd_get_vdm_support *req = NULL;
+	size_t resp_len, max_rsp_len, vdm_count;
 	struct vdm_type_support *cur_vdm;
+	uint16_t *cmd_type_ptr;
 	uint8_t *resp_buf;
 	int rc;
 
@@ -1039,15 +1045,10 @@ handle_control_get_vdm_type_support(struct ctx *ctx, int sd,
 		return -ENOMEM;
 	}
 	resp = (void *)resp_buf;
+	cmd_type_ptr = (uint16_t *)(resp + 1);
 	mctp_ctrl_msg_hdr_init_resp(&resp->ctrl_hdr, req->ctrl_hdr);
 
-	if (vdm_count == 0) {
-		if (ctx->verbose) {
-			warnx("Get VDM Type Support but no VDMs registered");
-		}
-		resp_len = sizeof(struct mctp_ctrl_resp);
-		resp->completion_code = MCTP_CTRL_CC_ERROR;
-	} else if (req->vendor_id_set_selector >= vdm_count) {
+	if (req->vendor_id_set_selector >= vdm_count) {
 		if (ctx->verbose) {
 			warnx("Get VDM Type Support selector %u out of range (max %zu)",
 			      req->vendor_id_set_selector, vdm_count);
@@ -1057,30 +1058,24 @@ handle_control_get_vdm_type_support(struct ctx *ctx, int sd,
 	} else {
 		cur_vdm =
 			&ctx->supported_vdm_types[req->vendor_id_set_selector];
-		vid_size_left = (cur_vdm->vid_format ==
-				 MCTP_GET_VDM_SUPPORT_PCIE_FORMAT_ID) ?
-					sizeof(uint16_t) :
-					0;
-		resp_len = max_rsp_len - vid_size_left;
-
 		resp->completion_code = MCTP_CTRL_CC_SUCCESS;
-		resp->vendor_id_set_selector =
-			req->vendor_id_set_selector == (vdm_count - 1) ?
-				MCTP_GET_VDM_SUPPORT_NO_MORE_CAP_SET :
-				req->vendor_id_set_selector + 1;
-		resp->vendor_id_format = cur_vdm->vid_format;
-		uint8_t *out_ptr = (uint8_t *)(resp + 1);
-		out_ptr -= vid_size_left;
+		resp->vendor_id_set_selector = req->vendor_id_set_selector + 1;
+		if (req->vendor_id_set_selector == (vdm_count - 1)) {
+			resp->vendor_id_set_selector =
+				MCTP_GET_VDM_SUPPORT_NO_MORE_CAP_SET;
+		}
+		resp->vendor_id_format = cur_vdm->format;
 
-		if (cur_vdm->vid_format ==
-		    MCTP_GET_VDM_SUPPORT_PCIE_FORMAT_ID) {
+		if (cur_vdm->format == VID_FORMAT_PCIE) {
+			cmd_type_ptr--;
+			resp_len = max_rsp_len - sizeof(uint16_t);
 			resp->vendor_id_data_pcie =
 				htobe16(cur_vdm->vendor_id.pcie);
 		} else {
 			resp->vendor_id_data_iana =
 				htobe32(cur_vdm->vendor_id.iana);
 		}
-		uint16_t *cmd_type_ptr = (uint16_t *)out_ptr;
+
 		*cmd_type_ptr = htobe16(cur_vdm->cmd_set);
 	}
 
@@ -3526,8 +3521,8 @@ static int on_dbus_peer_removed_vdm_type(sd_bus_track *track, void *userdata)
 		if (vdm_type->source_peer != track)
 			continue;
 		if (ctx->verbose) {
-			warnx("Removing VDM type support entry vid_format %d cmd_set 0x%04x",
-			      vdm_type->vid_format, vdm_type->cmd_set);
+			warnx("Removing VDM type support entry format %d cmd_set 0x%04x",
+			      vdm_type->format, vdm_type->cmd_set);
 		}
 		if (i != ctx->num_supported_vdm_types - 1) {
 			*vdm_type = ctx->supported_vdm_types
@@ -3631,63 +3626,77 @@ static int method_register_vdm_type_support(sd_bus_message *call, void *data,
 					    sd_bus_error *berr)
 {
 	struct vdm_type_support new_vdm, *cur_vdm_type, *new_vdm_types_arr;
+	const char *vid_type_str;
 	struct ctx *ctx = data;
+	uint8_t vid_format;
 	uint16_t vid_pcie;
 	uint32_t vid_iana;
 	int rc;
 
-	rc = sd_bus_message_read(call, "y", &new_vdm.vid_format);
+	rc = sd_bus_message_read(call, "y", &vid_format);
 	if (rc < 0)
 		goto err;
+	new_vdm.format = vid_format;
 
-	if (new_vdm.vid_format != MCTP_GET_VDM_SUPPORT_PCIE_FORMAT_ID &&
-	    new_vdm.vid_format != MCTP_GET_VDM_SUPPORT_IANA_FORMAT_ID) {
-		return sd_bus_error_setf(berr, SD_BUS_ERROR_INVALID_ARGS,
-					 "Unsupported VID format: %d",
-					 new_vdm.vid_format);
-	}
+	rc = sd_bus_message_peek_type(call, NULL, &vid_type_str);
+    if (rc < 0) {
+        return sd_bus_error_setf(berr, SD_BUS_ERROR_INVALID_ARGS,
+                                 "Failed to read variant type");
+    }
 
-	if (new_vdm.vid_format == MCTP_GET_VDM_SUPPORT_PCIE_FORMAT_ID) {
-		rc = sd_bus_message_read(call, "v", "q", &vid_pcie);
-		if (rc < 0)
-			goto err;
-		new_vdm.vendor_id.pcie = vid_pcie;
-	} else if (new_vdm.vid_format == MCTP_GET_VDM_SUPPORT_IANA_FORMAT_ID) {
-		rc = sd_bus_message_read(call, "v", "u", &vid_iana);
-		if (rc < 0)
-			goto err;
-		new_vdm.vendor_id.iana = vid_iana;
-	}
+    if (new_vdm.format == VID_FORMAT_PCIE) {
+	    if (strcmp(vid_type_str, "q") != 0) {
+		    return sd_bus_error_setf(
+			    berr, SD_BUS_ERROR_INVALID_ARGS,
+			    "Expected format is PCIe but variant contains '%s'",
+			    vid_type_str);
+	    }
+	    rc = sd_bus_message_read(call, "v", "q", &vid_pcie);
+	    if (rc < 0)
+		    goto err;
+	    new_vdm.vendor_id.pcie = vid_pcie;
+    } else if (new_vdm.format == VID_FORMAT_IANA) {
+	    if (strcmp(vid_type_str, "u") != 0) {
+		    return sd_bus_error_setf(
+			    berr, SD_BUS_ERROR_INVALID_ARGS,
+			    "Expected format is IANA but variant contains '%s'",
+			    vid_type_str);
+	    }
+	    rc = sd_bus_message_read(call, "v", "u", &vid_iana);
+	    if (rc < 0)
+		    goto err;
+	    new_vdm.vendor_id.iana = vid_iana;
+    } else {
+	    return sd_bus_error_setf(berr, SD_BUS_ERROR_INVALID_ARGS,
+				     "Unsupported VID format: %d",
+				     new_vdm.format);
+    }
 
-	rc = sd_bus_message_read(call, "q", &new_vdm.cmd_set);
-	if (rc < 0)
-		goto err;
+    rc = sd_bus_message_read(call, "q", &new_vdm.cmd_set);
+    if (rc < 0)
+	    goto err;
 
-	// Check for duplicates
-	for (size_t i = 0; i < ctx->num_supported_vdm_types; i++) {
-		if (ctx->supported_vdm_types[i].vid_format !=
-		    new_vdm.vid_format)
-			continue;
+    // Check for duplicates
+    for (size_t i = 0; i < ctx->num_supported_vdm_types; i++) {
+	    if (ctx->supported_vdm_types[i].format != new_vdm.format)
+		    continue;
 
-		if (ctx->supported_vdm_types[i].cmd_set != new_vdm.cmd_set)
-			continue;
+	    if (ctx->supported_vdm_types[i].cmd_set != new_vdm.cmd_set)
+		    continue;
 
-		bool vid_matches = false;
-		if (new_vdm.vid_format == MCTP_GET_VDM_SUPPORT_PCIE_FORMAT_ID) {
-			vid_matches =
-				(ctx->supported_vdm_types[i].vendor_id.pcie ==
-				 new_vdm.vendor_id.pcie);
-		} else {
-			vid_matches =
-				(ctx->supported_vdm_types[i].vendor_id.iana ==
-				 new_vdm.vendor_id.iana);
-		}
+	    bool vid_matches = false;
+	    if (new_vdm.format == VID_FORMAT_PCIE) {
+		    vid_matches = (ctx->supported_vdm_types[i].vendor_id.pcie ==
+				   new_vdm.vendor_id.pcie);
+	    } else {
+		    vid_matches = (ctx->supported_vdm_types[i].vendor_id.iana ==
+				   new_vdm.vendor_id.iana);
+	    }
 
-		if (vid_matches) {
-			return sd_bus_error_setf(berr,
-						 SD_BUS_ERROR_INVALID_ARGS,
-						 "VDM type already registered");
-		}
+	    if (vid_matches) {
+		    return sd_bus_error_setf(berr, SD_BUS_ERROR_INVALID_ARGS,
+					     "VDM type already registered");
+	    }
 	}
 
 	new_vdm_types_arr = realloc(ctx->supported_vdm_types,

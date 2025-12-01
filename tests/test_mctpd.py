@@ -1329,6 +1329,12 @@ async def test_register_vdm_type_support(mctpd):
                             asyncdbus.Variant('q', 0xABCD), 0x0001)
         assert str(ex.value) == "VDM type already registered"
 
+        # Verify incorrect VID type raises error
+        with pytest.raises(asyncdbus.errors.DBusError) as ex:
+            await mctp.call_register_vdm_type_support(0x00,
+                                asyncdbus.Variant('u', 0xABCDEF12), 0x0001)
+        assert "Expected format is PCIe but variant contains" in str(ex.value)
+
         # Verify PCIe VDM (selector 0)
         cmd = MCTPControlCommand(True, 0, 0x06, bytes([0x00]))
         rsp = await ep.send_control(mctpd.network.mctp_socket, cmd)
